@@ -1,4 +1,5 @@
 """Tests for hermes_logging — centralized logging setup."""
+import errno
 import io
 import logging
 import os
@@ -1074,6 +1075,106 @@ class TestExternalRotationRecovery:
         assert gw_path.exists(), "gateway.log was never recreated"
         assert "AFTER rotation" in gw_path.read_text()
         assert "AFTER rotation" not in rotated.read_text()
+
+
+class _BadTellStream:
+    """Stream wrapper that simulates an EIO from RotatingFileHandler.tell()."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    @property
+    def closed(self):
+        return self._wrapped.closed
+
+    def write(self, data):
+        return self._wrapped.write(data)
+
+    def seek(self, *args, **kwargs):
+        return self._wrapped.seek(*args, **kwargs)
+
+    def tell(self):
+        raise OSError(errno.EIO, "Input/output error")
+
+    def flush(self):
+        return self._wrapped.flush()
+
+    def close(self):
+        return self._wrapped.close()
+
+
+class _BadFlushStream:
+    """Stream wrapper that simulates an EIO from StreamHandler.flush()."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+
+    @property
+    def closed(self):
+        return self._wrapped.closed
+
+    def write(self, data):
+        return self._wrapped.write(data)
+
+    def seek(self, *args, **kwargs):
+        return self._wrapped.seek(*args, **kwargs)
+
+    def tell(self):
+        return self._wrapped.tell()
+
+    def flush(self):
+        raise OSError(errno.EIO, "Input/output error")
+
+    def close(self):
+        return self._wrapped.close()
+
+
+class TestStreamEioRecovery:
+    """_ManagedRotatingFileHandler recovers a bad already-open stream."""
+
+    def _make_record(self, msg: str) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name="gateway.run", level=logging.INFO, pathname="", lineno=0,
+            msg=msg, args=(), exc_info=None,
+        )
+        record.session_tag = ""
+        return record
+
+    def test_recovers_and_retries_once_when_stream_tell_raises_eio(self, tmp_path, capsys):
+        log_path = tmp_path / "gateway.log"
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(log_path), maxBytes=1024, backupCount=1, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        bad_stream = _BadTellStream(handler.stream)
+        handler.stream = bad_stream  # type: ignore[assignment]
+        try:
+            handler.emit(self._make_record("tell eio recovered"))
+
+            assert log_path.read_text() == "tell eio recovered\n"
+            assert handler.stream is not bad_stream
+            captured = capsys.readouterr()
+            assert "--- Logging error ---" not in captured.err
+        finally:
+            handler.close()
+
+    def test_recovers_and_retries_once_when_stream_flush_raises_eio(self, tmp_path, capsys):
+        log_path = tmp_path / "gateway.log"
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(log_path), maxBytes=0, backupCount=1, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        bad_stream = _BadFlushStream(handler.stream)
+        handler.stream = bad_stream  # type: ignore[assignment]
+        try:
+            handler.emit(self._make_record("flush eio recovered"))
+
+            assert log_path.read_text() == "flush eio recovered\n"
+            assert handler.stream is not bad_stream
+            captured = capsys.readouterr()
+            assert "--- Logging error ---" not in captured.err
+        finally:
+            handler.close()
 
 
 class TestSafeStderr:

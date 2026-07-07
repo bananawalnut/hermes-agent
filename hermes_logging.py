@@ -29,6 +29,7 @@ Session context:
 
 import atexit
 import copy
+import errno
 import io
 import logging
 import os
@@ -137,6 +138,21 @@ def _is_windows_concurrent_log_lock_timeout(exc: BaseException | None) -> bool:
         and isinstance(exc, RuntimeError)
         and _CONCURRENT_LOG_LOCK_TIMEOUT in str(exc)
     )
+
+
+def _is_recoverable_log_stream_io_error(exc: BaseException | None) -> bool:
+    """Return True for stream-level I/O failures that are safe to reopen."""
+    return isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EIO
+
+
+def _exception_originated_in_flush() -> bool:
+    """Return True when the active exception came through logging flush()."""
+    tb = sys.exc_info()[2]
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "flush":
+            return True
+        tb = tb.tb_next
+    return False
 
 
 # Third-party loggers that are noisy at DEBUG/INFO level.
@@ -511,6 +527,21 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             except Exception:
                 pass
 
+    def _reopen_stream_after_io_error(self) -> bool:
+        """Close a bad stream and reopen ``baseFilename`` after an EIO."""
+        try:
+            if self.stream is not None:
+                self.stream.close()
+        except Exception:
+            pass
+        self.stream = None  # type: ignore[assignment]
+        try:
+            self.stream = self._open()
+            self._record_stream_stat()
+            return True
+        except Exception:
+            return False
+
     def emit(self, record: logging.LogRecord) -> None:
         # Cheap-ish stat-per-record check; the kernel caches inode metadata
         # so the syscall is sub-microsecond on a hot file.
@@ -530,6 +561,19 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         the stdlib handler prints it to stderr (which, under the Desktop
         slash-worker, is captured and surfaced into chat output)."""
         exc = sys.exc_info()[1]
+        if _is_recoverable_log_stream_io_error(exc) and not getattr(
+            record, "_hermes_stream_eio_retry", False
+        ):
+            record._hermes_stream_eio_retry = True  # type: ignore[attr-defined]
+            flush_error = _exception_originated_in_flush()
+            if self._reopen_stream_after_io_error():
+                if flush_error:
+                    return
+                try:
+                    super().emit(record)
+                    return
+                except Exception:
+                    pass
         if _is_windows_concurrent_log_lock_timeout(exc):
             return
         super().handleError(record)
