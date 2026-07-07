@@ -171,6 +171,24 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
+def _tracking_ref_for_repo(repo_dir: Path) -> str:
+    """Return the current branch's upstream ref, falling back to origin/main."""
+    ref = _git_stdout(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        cwd=repo_dir,
+    )
+    return ref if ref and "/" in ref else "origin/main"
+
+
+def _split_remote_ref(ref: str) -> tuple[str, str] | None:
+    if not ref or "/" not in ref:
+        return None
+    remote, branch = ref.split("/", 1)
+    if not remote or not branch:
+        return None
+    return remote, branch
+
+
 def _check_via_rev(local_rev: str) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote.
 
@@ -193,7 +211,7 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind the active branch's upstream in a local checkout."""
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
@@ -201,6 +219,9 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if checked == UPDATE_AVAILABLE_NO_COUNT:
             return 1
         return checked
+
+    tracking_ref = _tracking_ref_for_repo(repo_dir)
+    split_ref = _split_remote_ref(tracking_ref)
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -214,7 +235,11 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        fetch_args = ["git", "fetch", "origin"]
+        fetch_args = ["git", "fetch"]
+        if split_ref:
+            fetch_args += [split_ref[0], split_ref[1]]
+        else:
+            fetch_args.append("origin")
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -227,13 +252,13 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
+        # No history to count across the shallow boundary. The tracking ref may
+        # not exist in a `clone --depth 1`, so prefer FETCH_HEAD (just updated by
+        # the fetch above) and fall back to the tracking ref.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", tracking_ref], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -241,7 +266,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{tracking_ref}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -427,10 +452,11 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    tracking_ref = _tracking_ref_for_repo(repo_dir)
+    upstream = _git_short_hash(repo_dir, tracking_ref)
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
+        # Live-git lookup failed (e.g. shallow clone without the tracking ref).
         # Fall back to the baked build SHA if available.
         try:
             from hermes_cli.build_info import get_build_sha
@@ -444,7 +470,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{tracking_ref}..HEAD"],
             capture_output=True,
             text=True,
             timeout=5,

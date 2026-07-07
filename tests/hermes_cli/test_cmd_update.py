@@ -15,6 +15,12 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
+        # git rev-parse --abbrev-ref --symbolic-full-name @{upstream}
+        if "rev-parse" in joined and "@{upstream}" in joined:
+            rc = 0 if verify_ok else 128
+            stdout = f"origin/{branch}\n" if verify_ok else ""
+            return subprocess.CompletedProcess(cmd, rc, stdout=stdout, stderr="")
+
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
@@ -225,6 +231,34 @@ class TestCmdUpdateBranchFallback:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_update_defaults_to_current_tracking_branch(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """Without --branch, source installs update the branch they track."""
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "remote get-url origin" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="git@github.com:example/hermes-agent.git\n", stderr="")
+            if "rev-parse --abbrev-ref --symbolic-full-name @{upstream}" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="origin/zenith/runtime\n", stderr="")
+            if "rev-parse --abbrev-ref HEAD" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="zenith/runtime\n", stderr="")
+            if "rev-list HEAD..origin/zenith/runtime --count" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        cmd_update(mock_args)
+
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert any("fetch origin zenith/runtime" in c for c in commands)
+        assert any("rev-list HEAD..origin/zenith/runtime --count" in c for c in commands)
+        assert not any("pull --ff-only origin main" in c for c in commands)
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_update_on_fork_checks_upstream_when_origin_up_to_date(
         self, mock_run, _mock_which, mock_args, capsys
     ):
@@ -243,12 +277,59 @@ class TestCmdUpdateBranchFallback:
             hm,
             "_get_origin_url",
             return_value="https://github.com/example/hermes-agent.git",
-        ), patch.object(hm, "_sync_with_upstream_if_needed") as sync_mock:
+        ), patch.object(hm, "_sync_with_upstream_if_needed", return_value=False) as sync_mock:
             cmd_update(mock_args)
 
         sync_mock.assert_called_once_with(["git"], PROJECT_ROOT)
         captured = capsys.readouterr()
         assert "Already up to date!" in captured.out
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_update_finishes_install_after_upstream_sync_when_origin_up_to_date(
+        self, mock_run, _mock_which, mock_args, capsys
+    ):
+        """An upstream fast-forward is a real update even when origin/main was
+        already current, so the updater must run the post-pull install steps.
+        """
+        from hermes_cli import main as hm
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(
+            hm, "_sync_with_upstream_if_needed", return_value=True
+        ) as sync_mock, patch.object(
+            hm, "_validate_critical_files_syntax", return_value=(True, None, None)
+        ), patch.object(
+            hm, "_install_python_dependencies_with_optional_fallback"
+        ) as install_mock, patch.object(
+            hm, "_refresh_active_lazy_features"
+        ), patch.object(
+            hm, "_update_node_dependencies"
+        ), patch.object(
+            hm, "_build_web_ui"
+        ), patch.object(
+            hm, "_desktop_packaged_executable", return_value=None
+        ), patch.object(
+            hm, "_desktop_dist_exists", return_value=False
+        ), patch("tools.skills_sync.sync_skills", return_value={
+            "copied": [], "updated": [], "user_modified": [], "cleaned": []
+        }), patch("hermes_cli.profiles.list_profiles", return_value=[]):
+            cmd_update(mock_args)
+
+        sync_mock.assert_called_once_with(["git"], PROJECT_ROOT)
+        assert install_mock.called
+        commands = [" ".join(str(a) for a in c.args[0]) for c in mock_run.call_args_list]
+        assert not any("pull --ff-only origin main" in c for c in commands), commands
+        out = capsys.readouterr().out
+        assert "Upstream sync updated the checkout" in out
+        assert "Already up to date!" not in out
 
     @patch("shutil.which")
     @patch("subprocess.run")

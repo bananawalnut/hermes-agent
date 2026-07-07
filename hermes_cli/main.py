@@ -6750,7 +6750,7 @@ def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
         return False
 
 
-def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
+def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> bool:
     """Check if fork is behind upstream and sync if safe.
 
     This implements the fork upstream sync logic:
@@ -6758,13 +6758,17 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     - Compare origin/main with upstream/main
     - If origin/main is strictly behind upstream/main, pull from upstream
     - Try to sync fork back to origin if possible
+
+    Returns True when the local checkout changed. ``hermes update`` must then
+    continue through the normal post-pull install/migration steps instead of
+    stopping after the fork sync.
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
     if not has_upstream:
         # Check if user previously declined
         if _should_skip_upstream_prompt():
-            return
+            return False
 
         # Ask user if they want to add upstream
         print()
@@ -6788,13 +6792,13 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
                 has_upstream = True
             else:
                 print("  ✗ Failed to add upstream remote. Skipping upstream sync.")
-                return
+                return False
         else:
             print(
                 "  Skipped. Run 'git remote add upstream https://github.com/NousResearch/hermes-agent.git' to add later."
             )
             _mark_skip_upstream_prompt()
-            return
+            return False
 
     # Fetch upstream main only. This sync compares upstream/main with
     # origin/main, so there's no reason to pull every upstream ref — and a bare
@@ -6810,7 +6814,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         )
     except subprocess.CalledProcessError:
         print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
+        return False
 
     # Compare origin/main with upstream/main
     origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
@@ -6820,7 +6824,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     if origin_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
-        return
+        return False
 
     # If origin/main has commits not on upstream, don't trample
     if origin_ahead > 0:
@@ -6829,12 +6833,12 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  Skipping upstream sync to preserve your changes.")
         print("  If you want to merge upstream changes, run:")
         print("    git pull upstream main")
-        return
+        return False
 
     # If upstream is not ahead, fork is up to date
     if upstream_ahead == 0:
         print("  ✓ Fork is up to date with upstream")
-        return
+        return False
 
     # origin/main is strictly behind upstream/main (can fast-forward)
     print()
@@ -6851,7 +6855,7 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print(
             "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
         )
-        return
+        return False
 
     print("  ✓ Updated from upstream")
 
@@ -6864,6 +6868,8 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
         )
         print("    Your local repo is updated, but your fork on GitHub may be behind.")
+
+    return True
 
 
 def _invalidate_update_cache():
@@ -8349,14 +8355,37 @@ def _finalize_update_output(state):
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` into a non-empty branch name.
+    """Resolve the branch ``hermes update`` should operate on.
 
-    Centralizes the "default to main, accept --branch override, treat empty
-    or whitespace-only values as the default" parsing so every consumer of
-    ``--branch`` (check path, git-update path, ZIP-fallback path) agrees on
-    the same answer.
+    An explicit ``--branch`` always wins.  Without one, prefer the current
+    branch's configured upstream (for example ``origin/zenith/runtime``).  This
+    lets source installs that intentionally run from a fork branch update that
+    branch in-place instead of silently switching back to ``main``.  Detached
+    checkouts or branches without an upstream keep the historical default of
+    ``main``.
     """
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    explicit = (getattr(args, "branch", None) or "").strip()
+    if explicit:
+        return explicit
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            upstream_ref = (result.stdout or "").strip()
+            if "/" in upstream_ref:
+                branch = upstream_ref.split("/", 1)[1].strip()
+                if branch:
+                    return branch
+    except Exception:
+        pass
+
+    return "main"
 
 
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
@@ -9613,85 +9642,90 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         commit_count = int(result.stdout.strip())
 
+        updated_from_upstream = False
         if commit_count == 0:
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
             if is_fork and branch == "main":
-                _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
+                updated_from_upstream = _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd,
-                    PROJECT_ROOT,
-                    auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in {branch, "HEAD"}:
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-
-            # A current checkout does NOT imply a healthy install: a previous
-            # dependency sync may have failed partway (classic on Windows,
-            # where a running gateway/desktop backend keeps .pyd files locked
-            # and uv/pip dies with access-denied, stranding the venv between
-            # versions). Probe the venv's core imports and repair if broken —
-            # otherwise "Already up to date!" gaslights the user while their
-            # install stays bricked.
-            healthy, detail = _venv_core_imports_healthy()
-            if not healthy:
-                print("⚠ Checkout is current, but the venv is unhealthy:")
-                print(f"  {detail}")
-                print("→ Repairing Python dependencies...")
-                _write_update_incomplete_marker()
-                from hermes_cli.managed_uv import ensure_uv
-
-                repair_uv = ensure_uv()
-                # A managed install whose venv is gone entirely (interrupted
-                # repair after the old venv was moved aside) needs the venv
-                # recreated before dependencies can be installed into it.
-                venv_python_missing = not (
-                    PROJECT_ROOT
-                    / "venv"
-                    / ("Scripts" if _is_windows() else "bin")
-                    / ("python.exe" if _is_windows() else "python")
-                ).exists()
-                if venv_python_missing and repair_uv:
-                    print("→ Recreating virtual environment...")
+            if updated_from_upstream:
+                print("→ Upstream sync updated the checkout; finishing install update...")
+            else:
+                # Restore stash and switch back to original branch if we moved
+                if auto_stash_ref is not None:
+                    _restore_stashed_changes(
+                        git_cmd,
+                        PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=prompt_for_restore,
+                        input_fn=gw_input_fn,
+                    )
+                if current_branch not in {branch, "HEAD"}:
                     subprocess.run(
-                        [repair_uv, "venv", "venv"],
+                        git_cmd + ["checkout", current_branch],
                         cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
                         check=False,
                     )
-                if repair_uv:
-                    repair_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
-                    _install_python_dependencies_with_optional_fallback(
-                        [repair_uv, "pip"], env=repair_env, group="all"
-                    )
-                else:
-                    _install_python_dependencies_with_optional_fallback(
-                        [sys.executable, "-m", "pip"], group="all"
-                    )
-                _clear_update_incomplete_marker()
-                healthy_after, detail_after = _venv_core_imports_healthy()
-                if healthy_after:
-                    print("✓ Dependencies repaired!")
-                else:
-                    print(f"⚠ Venv still unhealthy after repair: {detail_after}")
-                    print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
-                print("✓ Already up to date!")
-            _resume_windows_gateways_after_update(_windows_gateway_resume)
-            return
 
-        print(f"→ Found {commit_count} new commit(s)")
+                # A current checkout does NOT imply a healthy install: a previous
+                # dependency sync may have failed partway (classic on Windows,
+                # where a running gateway/desktop backend keeps .pyd files locked
+                # and uv/pip dies with access-denied, stranding the venv between
+                # versions). Probe the venv's core imports and repair if broken —
+                # otherwise "Already up to date!" gaslights the user while their
+                # install stays bricked.
+                healthy, detail = _venv_core_imports_healthy()
+                if not healthy:
+                    print("⚠ Checkout is current, but the venv is unhealthy:")
+                    print(f"  {detail}")
+                    print("→ Repairing Python dependencies...")
+                    _write_update_incomplete_marker()
+                    from hermes_cli.managed_uv import ensure_uv
+
+                    repair_uv = ensure_uv()
+                    # A managed install whose venv is gone entirely (interrupted
+                    # repair after the old venv was moved aside) needs the venv
+                    # recreated before dependencies can be installed into it.
+                    venv_python_missing = not (
+                        PROJECT_ROOT
+                        / "venv"
+                        / ("Scripts" if _is_windows() else "bin")
+                        / ("python.exe" if _is_windows() else "python")
+                    ).exists()
+                    if venv_python_missing and repair_uv:
+                        print("→ Recreating virtual environment...")
+                        subprocess.run(
+                            [repair_uv, "venv", "venv"],
+                            cwd=PROJECT_ROOT,
+                            check=False,
+                        )
+                    if repair_uv:
+                        repair_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+                        _install_python_dependencies_with_optional_fallback(
+                            [repair_uv, "pip"], env=repair_env, group="all"
+                        )
+                    else:
+                        _install_python_dependencies_with_optional_fallback(
+                            [sys.executable, "-m", "pip"], group="all"
+                        )
+                    _clear_update_incomplete_marker()
+                    healthy_after, detail_after = _venv_core_imports_healthy()
+                    if healthy_after:
+                        print("✓ Dependencies repaired!")
+                    else:
+                        print(f"⚠ Venv still unhealthy after repair: {detail_after}")
+                        print("  Close all Hermes windows/gateways and re-run: hermes update")
+                else:
+                    print("✓ Already up to date!")
+                _resume_windows_gateways_after_update(_windows_gateway_resume)
+                return
+
+        if commit_count > 0:
+            print(f"→ Found {commit_count} new commit(s)")
 
         # Snapshot critical state (state.db, config, pairing JSONs, etc.)
         # before pulling so a user can recover if something goes wrong.
@@ -9710,7 +9744,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Never let a snapshot failure block an update.
             logger.debug("Pre-update snapshot failed: %s", exc)
 
-        print("→ Pulling updates...")
+        if not updated_from_upstream:
+            print("→ Pulling updates...")
         update_succeeded = False
         # Capture the pre-pull SHA so we can auto-roll-back if the new code
         # has a syntax error in a critical-path file (PR #28452 incident:
@@ -9719,33 +9754,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+            if not updated_from_upstream:
+                pull_result = subprocess.run(
+                    git_cmd + ["pull", "--ff-only", "origin", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                if pull_result.returncode != 0:
+                    # ff-only failed — local and remote have diverged (e.g. upstream
+                    # force-pushed or rebase).  Since local changes are already
+                    # stashed, reset to match the remote exactly.
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
-                    sys.exit(1)
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=PROJECT_ROOT,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
@@ -9828,7 +9864,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
 
         # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        if is_fork and branch == "main" and not updated_from_upstream:
             _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra

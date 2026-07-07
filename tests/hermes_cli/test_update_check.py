@@ -93,8 +93,8 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    # origin probe + is-shallow probe + git fetch + git rev-list
-    assert mock_run.call_count == 4
+    # origin probe + tracking-ref probe + is-shallow probe + git fetch + git rev-list
+    assert mock_run.call_count == 5
 
 
 def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
@@ -167,7 +167,7 @@ def test_check_via_local_git_shallow_clone_behind_reports_no_count(tmp_path):
 
     assert result == banner.UPDATE_AVAILABLE_NO_COUNT
     # The shallow fetch must preserve the boundary (--depth 1), not unshallow.
-    assert ["git", "fetch", "origin", "--depth", "1", "--quiet"] in calls
+    assert ["git", "fetch", "origin", "main", "--depth", "1", "--quiet"] in calls
 
 
 def test_check_via_local_git_shallow_clone_up_to_date(tmp_path):
@@ -220,6 +220,37 @@ def test_check_via_local_git_full_clone_keeps_exact_count(tmp_path):
         result = banner._check_via_local_git(repo_dir)
 
     assert result == 7
+
+
+def test_check_via_local_git_uses_current_tracking_branch(tmp_path):
+    """Fork branch installs compare against their configured origin branch, not origin/main."""
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["git", "remote", "get-url", "origin"]:
+            return MagicMock(returncode=0, stdout="https://github.com/example/hermes-agent.git\n")
+        if cmd == ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]:
+            return MagicMock(returncode=0, stdout="origin/zenith/runtime\n")
+        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
+            return MagicMock(returncode=0, stdout="false\n")
+        if cmd == ["git", "fetch", "origin", "zenith/runtime", "--quiet"]:
+            return MagicMock(returncode=0, stdout="")
+        if cmd == ["git", "rev-list", "--count", "HEAD..origin/zenith/runtime"]:
+            return MagicMock(returncode=0, stdout="0\n")
+        raise AssertionError(f"unexpected git command: {cmd!r}")
+
+    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+        result = banner._check_via_local_git(repo_dir)
+
+    assert result == 0
+    assert ["git", "fetch", "origin", "zenith/runtime", "--quiet"] in calls
+    assert ["git", "rev-list", "--count", "HEAD..origin/main"] not in calls
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
