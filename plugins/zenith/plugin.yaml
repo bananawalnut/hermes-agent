@@ -1,0 +1,8 @@
+name: zenith
+version: 0.1.0
+description: "Local Zenith vault helpers for daily notes and artifact-linked todos. Tools are inert until the zenith toolset is enabled."
+author: NousResearch
+kind: backend
+provides_tools:
+  - zenith_daily_note_log
+  - zenith_daily_todo

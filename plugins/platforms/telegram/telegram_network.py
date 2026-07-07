@@ -200,8 +200,8 @@ async def discover_fallback_ips() -> list[str]:
     than excluded: in many networks the system-DNS IP is the most reliable path
     to api.telegram.org and a transient primary-path failure should be retried
     against the same address via the IP-rewrite path before the seed list is
-    consulted (#14520).  Falls back to a hardcoded seed list only when DoH
-    yields no usable answers.
+    consulted (#14520).  Hardcoded seed IPs are appended as a final fallback
+    tier because DoH can return only the same unreachable edge as system DNS.
     """
     async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
         doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
@@ -216,10 +216,15 @@ async def discover_fallback_ips() -> list[str]:
         if isinstance(r, list):
             doh_ips.extend(r)
 
-    # Deduplicate preserving order
+    # Deduplicate preserving order.  Keep discovered DNS answers first, but
+    # always append the seed list as a final fallback tier: DoH can legitimately
+    # return only the same unroutable edge IP as system DNS on networks where a
+    # different Telegram-owned edge (for example 149.154.167.220) is reachable.
+    # Returning the seed list only when DoH is empty leaves that real-world case
+    # with a one-IP retry chain and no path to recovery.
     seen: set[str] = set()
     candidates: list[str] = []
-    for ip in doh_ips:
+    for ip in [*doh_ips, *_SEED_FALLBACK_IPS]:
         if ip not in seen:
             seen.add(ip)
             candidates.append(ip)
@@ -228,15 +233,15 @@ async def discover_fallback_ips() -> list[str]:
     validated = _normalize_fallback_ips(candidates)
 
     if validated:
-        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
+        logger.debug("Discovered Telegram fallback IPs: %s", ", ".join(validated))
         return validated
 
     logger.info(
-        "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
+        "DoH discovery and seed fallback list yielded no usable IPs (system DNS: %s; seeds: %s)",
         ", ".join(system_ips) or "unknown",
         ", ".join(_SEED_FALLBACK_IPS),
     )
-    return list(_SEED_FALLBACK_IPS)
+    return []
 
 
 def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:

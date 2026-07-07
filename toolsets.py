@@ -324,6 +324,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "zenith": {
+        "description": "Zenith/local-vault daily note and artifact-linked todo helpers",
+        "tools": ["zenith_daily_note_log", "zenith_daily_todo"],
+        "includes": []
+    },
+
 
     # Scenario-specific toolsets
     

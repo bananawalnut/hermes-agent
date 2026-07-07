@@ -590,7 +590,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]
 
     @pytest.mark.asyncio
     async def test_doh_timeout_falls_back_to_seed(self, monkeypatch):
@@ -630,7 +630,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]
 
     @pytest.mark.asyncio
     async def test_system_dns_failure_keeps_all_doh_ips(self, monkeypatch):
@@ -646,12 +646,13 @@ class TestDiscoverFallbackIps:
 
     @pytest.mark.asyncio
     async def test_all_doh_ips_same_as_system_dns_kept(self, monkeypatch):
-        """DoH agrees with system DNS — keep that IP instead of seed list (#14520).
+        """DoH agrees with system DNS — keep that IP before seed list (#14520).
 
         Previous behavior fell through to ``_SEED_FALLBACK_IPS`` here, but the
         seed addresses are not routable on every network.  When DoH confirms
-        the system IP, that IP is the best candidate we have and should be
-        used as the fallback target.
+        the system IP, that IP remains the first candidate, but the rest of the
+        seed list still follows so a one-IP unreachable edge cannot exhaust the
+        whole startup chain.
         """
         self._patch_doh(monkeypatch, {
             "https://dns.google": (200, _doh_answer("149.154.166.110")),
@@ -659,7 +660,22 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.166.110"]
+        assert ips == ["149.154.166.110", "149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_seed_ips_appended_when_doh_returns_only_unreachable_system_ip(self, monkeypatch):
+        """DoH may agree with system DNS on an edge that cannot be reached.
+
+        Keep that IP first for #14520, but append seed IPs so the transport can
+        still recover by trying another Telegram edge before startup gives up.
+        """
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("149.154.166.110")),
+            "https://cloudflare-dns.com": (200, _doh_answer("149.154.166.110")),
+        }, system_dns_ips=["149.154.166.110"])
+
+        ips = await tnet.discover_fallback_ips()
+        assert ips == ["149.154.166.110", "149.154.167.220"]
 
     @pytest.mark.asyncio
     async def test_cloudflare_gets_accept_header(self, monkeypatch):
@@ -690,7 +706,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]
 
     @pytest.mark.asyncio
     async def test_invalid_ip_in_doh_response_skipped(self, monkeypatch):
@@ -704,4 +720,4 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]
